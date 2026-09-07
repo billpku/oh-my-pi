@@ -22,6 +22,23 @@
   Fork of <a href="https://github.com/badlogic/pi-mono">Pi</a> by <a href="https://github.com/mariozechner">@mariozechner</a> 
 </p>
 
+---
+
+> [!IMPORTANT]
+> **This fork adds timed auto-accept for plan approval** — see [`FORK.md`](./FORK.md).
+>
+> Upstream, the plan-approval overlay and plan-mode `ask` prompts block forever when nobody is
+> at the keyboard, so an unattended session stops at the approval gate instead of implementing
+> the plan it just wrote. This fork adds a countdown that auto-selects a configured default.
+>
+> Three new settings, all defaulting to today's behavior: `plan.approvalTimeout`,
+> `plan.approvalDefault`, `ask.timeoutInPlanMode`.
+>
+> Upstream PR: [can1357/oh-my-pi#11166](https://github.com/can1357/oh-my-pi/pull/11166) ·
+> Branch: [`plan-approval-timeout`](https://github.com/billpku/oh-my-pi/tree/plan-approval-timeout)
+
+---
+
 The most capable agent surface that ships. Continuously tuned by real-world use — complete out of the box, open all the way down.
 
 **60+** providers · **31** built-in tools · **14** lsp ops · **28** dap ops · **~80k** lines of Rust core.
