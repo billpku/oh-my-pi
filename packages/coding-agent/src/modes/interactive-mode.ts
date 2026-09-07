@@ -3738,6 +3738,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
+		// The editor stops the TUI and awaits a child process, so no keypress can
+		// reach `handleInput` to reset the approval countdown. Left running it
+		// would expire mid-edit and approve the pre-edit plan, and the editor's
+		// write would then land on an already-executing session.
+		this.#planReviewOverlay?.suspendCountdown();
 		try {
 			this.ui.stop();
 			const result = await openInEditor(editorCmd, currentText, {
@@ -3753,6 +3758,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
 			this.ui.start();
+			this.#planReviewOverlay?.resumeCountdown();
 			this.ui.requestRender(true);
 		}
 	}
@@ -3764,6 +3770,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
+		// Same suspend as the plan editor: the annotation editor also stops the TUI
+		// and blocks on a child process, so the countdown must not run meanwhile.
+		this.#planReviewOverlay?.suspendCountdown();
 		try {
 			this.ui.stop();
 			const result = await openInEditor(editorCmd, draft, { extension: ".md" });
@@ -3774,6 +3783,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
 			this.ui.start();
+			this.#planReviewOverlay?.resumeCountdown();
 			this.ui.requestRender(true);
 		}
 	}
@@ -3807,6 +3817,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			preserveContext?: boolean;
 			compactBeforeExecute?: boolean;
 			executionModel?: ResolvedRoleModel;
+			/** Seconds of the expired approval timeout, when nobody picked this. */
+			autoApprovedAfterSeconds?: number;
 		},
 	): Promise<boolean> {
 		const previousPresentation = this.#planModePreviousToolPresentation ?? {
@@ -3931,6 +3943,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		const planModePrompt = prompt.render(planModeApprovedPrompt, {
 			planFilePath: options.planFilePath,
 			contextPreserved: options.preserveContext === true,
+			// Durable disclosure: `showWarning` is a UI component that the
+			// `preserveContext: false` clear wipes, so the record of "nobody
+			// reviewed this" has to ride the synthetic prompt into the new session.
+			autoApproved: options.autoApprovedAfterSeconds !== undefined,
+			autoApprovalSeconds: options.autoApprovedAfterSeconds,
 		});
 		// Close the review overlay only now — after the async title write and plan
 		// prompt are prepared, immediately before the execution turn is queued. The
@@ -4650,11 +4667,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		if (choice === "Approve and execute" || choice === "Approve and compact context" || choice === keepContextLabel) {
-			// Disclose that nobody picked this — the transcript must not read as a
-			// deliberate operator choice. Mirrors ask's "auto-selected after timeout".
-			if (autoSelected) {
-				this.showWarning(`Plan auto-approved after ${approvalTimeoutSeconds}s with "${choice}".`);
-			}
+			// The durable disclosure rides the synthetic approved-plan prompt (see
+			// `#approvePlan`); an on-screen notice is emitted *after* dispatch so it
+			// survives the `preserveContext: false` clear, which resets the transcript.
 			try {
 				// Prefer in-overlay edits (already in memory) over a disk re-read. The
 				// overlay mirrors edits as they happen, and approval awaits one final
@@ -4702,7 +4717,11 @@ export class InteractiveMode implements InteractiveModeContext {
 					preserveContext: choice !== "Approve and execute",
 					compactBeforeExecute: choice === "Approve and compact context",
 					executionModel,
+					autoApprovedAfterSeconds: autoSelected ? approvalTimeoutSeconds : undefined,
 				});
+				if (autoSelected) {
+					this.showWarning(`Plan auto-approved after ${approvalTimeoutSeconds}s with "${choice}".`);
+				}
 				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
 			} catch (error) {
 				this.showError(

@@ -223,6 +223,10 @@ export class PlanReviewOverlay implements Component {
 	#countdown: CountdownTimer | undefined;
 	/** Seconds left on `#countdown`, rendered next to the prompt title. */
 	#countdownSeconds: number | undefined;
+	/** Retained so the timer can be re-armed after a suspend. */
+	#countdownConfig: { timeoutMs: number; tui: TUI; label: string } | undefined;
+	/** True between `suspendCountdown` and `resumeCountdown`. */
+	#countdownSuspended = false;
 
 	constructor(
 		planContent: string,
@@ -270,10 +274,17 @@ export class PlanReviewOverlay implements Component {
 		if (timeoutMs <= 0 || !options.tui) return;
 		const target = options.timeoutIndex ?? 0;
 		if (target < 0 || target >= this.#options.length || this.#disabled.has(target)) return;
-		const label = this.#options[target]!;
+		this.#countdownConfig = { timeoutMs, tui: options.tui, label: this.#options[target]! };
+		this.#armCountdown();
+	}
+
+	/** (Re)start the timer from a full window using the stored config. */
+	#armCountdown(): void {
+		const config = this.#countdownConfig;
+		if (!config || this.#committed) return;
 		this.#countdown = new CountdownTimer(
-			timeoutMs,
-			options.tui,
+			config.timeoutMs,
+			config.tui,
 			seconds => {
 				this.#countdownSeconds = seconds;
 			},
@@ -284,18 +295,42 @@ export class PlanReviewOverlay implements Component {
 				// Latch before dispatching so a keypress racing the expiry cannot
 				// double-fire: `handleInput` returns early once `#committed` is set.
 				this.#committed = true;
-				this.#committedLabel = label;
-				this.callbacks.onTimeoutSelect?.(label);
-				this.callbacks.onPick(label);
+				this.#committedLabel = config.label;
+				this.callbacks.onTimeoutSelect?.(config.label);
+				this.callbacks.onPick(config.label);
 			},
 		);
 	}
 
-	/** Stop the auto-select countdown. Idempotent; safe after expiry. */
+	/** Pause the countdown while a modal, out-of-band interaction owns the
+	 *  terminal — notably an external editor, which stops the TUI and awaits a
+	 *  child process, so no `handleInput` can arrive to reset the timer. Without
+	 *  this the window expires mid-edit and approves the pre-edit plan.
+	 *  Idempotent; safe when no countdown is configured. */
+	suspendCountdown(): void {
+		if (!this.#countdownConfig) return;
+		this.#countdown?.dispose();
+		this.#countdown = undefined;
+		this.#countdownSeconds = undefined;
+		this.#countdownSuspended = true;
+	}
+
+	/** Resume after `suspendCountdown`, restarting a full window: the operator
+	 *  was demonstrably present, so they get the whole budget back. No-op unless
+	 *  actually suspended, and never revives a committed overlay. */
+	resumeCountdown(): void {
+		if (!this.#countdownSuspended) return;
+		this.#countdownSuspended = false;
+		this.#armCountdown();
+	}
+
+	/** Stop the auto-select countdown for good. Idempotent; safe after expiry. */
 	dispose(): void {
 		this.#countdown?.dispose();
 		this.#countdown = undefined;
 		this.#countdownSeconds = undefined;
+		this.#countdownSuspended = false;
+		this.#countdownConfig = undefined;
 	}
 
 	invalidate(): void {

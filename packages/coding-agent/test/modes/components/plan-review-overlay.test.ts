@@ -1065,5 +1065,74 @@ describe("PlanReviewOverlay", () => {
 			vi.advanceTimersByTime(600_000);
 			expect(onPick).not.toHaveBeenCalled();
 		});
+
+		it("does not expire while suspended for an external editor", () => {
+			const onPick = vi.fn();
+			const overlay = new PlanReviewOverlay(
+				"plan body",
+				{
+					promptTitle: "Plan mode - next step",
+					options: APPROVAL_OPTIONS,
+					timeoutMs: 20_000,
+					timeoutIndex: 0,
+					tui: TUI_STUB,
+				},
+				{ onPick, onCancel: vi.fn() },
+			);
+
+			overlay.suspendCountdown();
+			// An editor session far longer than the window: the TUI is stopped, so no
+			// keypress can reach handleInput to reset the timer.
+			vi.advanceTimersByTime(10 * 60_000);
+			expect(onPick).not.toHaveBeenCalled();
+			expect(promptLine(overlay)).not.toMatch(/\(\d+s\)/);
+
+			overlay.resumeCountdown();
+			expect(promptLine(overlay)).toContain("Plan mode - next step (20s)");
+			vi.advanceTimersByTime(19_000);
+			expect(onPick).not.toHaveBeenCalled();
+
+			vi.advanceTimersByTime(1_000);
+			expect(onPick.mock.calls).toEqual([["Approve and execute"]]);
+		});
+
+		it("keeps suspend/resume inert when no timeout is configured", () => {
+			const onPick = vi.fn();
+			const overlay = new PlanReviewOverlay(
+				"plan body",
+				{ promptTitle: "Plan mode - next step", options: APPROVAL_OPTIONS },
+				{ onPick, onCancel: vi.fn() },
+			);
+
+			overlay.suspendCountdown();
+			overlay.resumeCountdown();
+
+			expect(promptLine(overlay)).not.toMatch(/\(\d+s\)/);
+			vi.advanceTimersByTime(600_000);
+			expect(onPick).not.toHaveBeenCalled();
+		});
+
+		it("does not revive the countdown when resumed after disposal", () => {
+			const onPick = vi.fn();
+			const overlay = new PlanReviewOverlay(
+				"plan body",
+				{
+					promptTitle: "Plan mode - next step",
+					options: APPROVAL_OPTIONS,
+					timeoutMs: 20_000,
+					timeoutIndex: 0,
+					tui: TUI_STUB,
+				},
+				{ onPick, onCancel: vi.fn() },
+			);
+
+			// Editor open when the overlay is torn down (Esc, session switch).
+			overlay.suspendCountdown();
+			overlay.dispose();
+			overlay.resumeCountdown();
+
+			vi.advanceTimersByTime(600_000);
+			expect(onPick).not.toHaveBeenCalled();
+		});
 	});
 });
