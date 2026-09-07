@@ -2122,6 +2122,112 @@ describe("InteractiveMode plan review rendering", () => {
 			expect(mode.planModeEnabled).toBe(false);
 			expect(prompt.mock.calls.some(isPlanApprovedCall)).toBe(true);
 			expect(overlayHandle.hide).toHaveBeenCalled();
+
+			// The disclosure must survive `handleClearCommand`, which resets the
+			// transcript on this default `execute` path — so it rides the synthetic
+			// approved-plan prompt rather than living only in a UI warning.
+			const dispatched = prompt.mock.calls.find(isPlanApprovedCall)?.[0] as string;
+			expect(dispatched).toContain("Auto-approved");
+			expect(dispatched).toContain("no operator input");
+		});
+
+		it("omits the auto-approval line from the approved-plan prompt on a manual pick", async () => {
+			session.settings.set("plan.approvalTimeout", 600);
+			const planFilePath = "local://PLAN.md";
+			const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			});
+			await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+			mode.planModeEnabled = true;
+			mode.planModePlanFilePath = planFilePath;
+			vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+			const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+			vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+
+			await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+			const dispatched = prompt.mock.calls.find(isPlanApprovedCall)?.[0] as string;
+			expect(dispatched).toContain("Plan approved.");
+			expect(dispatched).not.toContain("Auto-approved");
+		});
+
+		it("does not auto-approve while a real external editor outlives the window", async () => {
+			// Regression (PR #11166 review): the editor stops the TUI and awaits a
+			// child process, so no keypress can reach handleInput to reset the timer.
+			// Left running, the countdown expired mid-edit, approved the pre-edit
+			// plan, and the editor's write landed on an already-executing session.
+			const editorPath = path.join(tempDir.path(), "slow-editor.sh");
+			await Bun.write(editorPath, "#!/bin/sh\nsleep 1\nprintf '# Plan\\n\\nedited in editor\\n' > \"$1\"\n");
+			await fs.chmod(editorPath, 0o755);
+			const previousEditor = Bun.env.EDITOR;
+			const previousVisual = Bun.env.VISUAL;
+			const keybindings = KeybindingsManager.inMemory({ "app.editor.external": "ctrl+e" });
+			mode.keybindings = keybindings;
+			setKeybindings(keybindings);
+
+			// 0.3s window against a ~1s editor: without the suspend this expires
+			// while the child process is still running.
+			session.settings.set("plan.approvalTimeout", 0.3);
+			const planFilePath = "local://PLAN.md";
+			const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			});
+			await Bun.write(resolvedPlanPath, "# Plan\n\noriginal body");
+			mode.planModeEnabled = true;
+			mode.planModePlanFilePath = planFilePath;
+			vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+			vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+			const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+			let capturedOverlay: PlanReviewOverlay | undefined;
+			vi.spyOn(mode.ui, "showOverlay").mockImplementation(component => {
+				capturedOverlay = component as PlanReviewOverlay;
+				// Enter the external editor as soon as the overlay mounts.
+				queueMicrotask(() => capturedOverlay?.handleInput("\x05"));
+				return { hide: vi.fn() } as never;
+			});
+			// Resolve on the editor's real commit signal rather than a guessed sleep;
+			// setPlanContent is what #openPlanInExternalEditor calls after the child
+			// process returns, i.e. the exact moment the suspend window closes.
+			const { promise: editorReturned, resolve: markEditorReturned } = Promise.withResolvers<void>();
+			const setPlanContent = PlanReviewOverlay.prototype.setPlanContent;
+			vi.spyOn(PlanReviewOverlay.prototype, "setPlanContent").mockImplementation(function (
+				this: PlanReviewOverlay,
+				content: string,
+			) {
+				setPlanContent.call(this, content);
+				markEditorReturned();
+			});
+
+			try {
+				Bun.env.EDITOR = editorPath;
+				delete Bun.env.VISUAL;
+				const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+				// The editor ran ~1s against a 0.3s window. If the countdown had kept
+				// ticking it would already have approved the pre-edit plan by now.
+				await editorReturned;
+				expect(prompt.mock.calls.some(isPlanApprovedCall)).toBe(false);
+				expect(mode.planModeEnabled).toBe(true);
+
+				// The editor's write reached the plan file rather than a session that
+				// had already started executing the pre-edit plan.
+				expect(await Bun.file(resolvedPlanPath).text()).toContain("edited in editor");
+
+				// Resume re-arms a full window, so the approval still lands — and it
+				// lands after the editor's write, so execution reads the edited plan.
+				await approval;
+				expect(prompt.mock.calls.some(isPlanApprovedCall)).toBe(true);
+				expect(await Bun.file(resolvedPlanPath).text()).toContain("edited in editor");
+			} finally {
+				if (previousEditor === undefined) delete Bun.env.EDITOR;
+				else Bun.env.EDITOR = previousEditor;
+				if (previousVisual === undefined) delete Bun.env.VISUAL;
+				else Bun.env.VISUAL = previousVisual;
+				capturedOverlay?.dispose();
+			}
 		});
 	});
 
