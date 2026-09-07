@@ -110,6 +110,20 @@ bun install
 The fork's `main` already carries the change; `plan-approval-timeout` is the same commit, kept as
 the PR branch.
 
+**Then stage the native addon.** It is gitignored and not in the repo, and without it every CLI
+invocation — including `--version` and `config list` — dies with
+`Failed to load pi_natives native addon`. Building it needs a Bazel toolchain, so unless you have
+one, use the published prebuilt for your platform:
+
+```sh
+cd /tmp && npm pack @oh-my-pi/pi-natives-darwin-arm64@18.1.13
+tar xzf oh-my-pi-pi-natives-darwin-arm64-18.1.13.tgz
+cp package/pi_natives.darwin-arm64.node <repo>/packages/natives/native/
+```
+
+Swap the package name for your platform (`pi-natives-linux-x64`, etc.) and version-match it — a
+stale addon fails later with `api().vcsDiscover is not a function`.
+
 `packages/coding-agent/scripts/omp` is the supported dev launcher. Alias it — **do not overwrite
 `~/.bun/bin/omp`**, so the released binary and `omp update` keep working:
 
@@ -121,19 +135,6 @@ omp-dev --version   # omp/18.1.14
 Both binaries read the same `~/.omp/agent/config.yml`. The released binary starts fine with the
 three new keys present — it just ignores them — so you can switch back and forth freely. (Its
 `config set` will reject the unknown key names; set them with `omp-dev config set` instead.)
-
-### Native addon
-
-`bun test` needs the compiled native addon, which is gitignored and not in the repo. If the repo
-has no Bazel toolchain available, grab the published prebuilt matching your version:
-
-```sh
-cd /tmp && npm pack @oh-my-pi/pi-natives-darwin-arm64@18.1.13
-tar xzf oh-my-pi-pi-natives-darwin-arm64-18.1.13.tgz
-cp package/pi_natives.darwin-arm64.node <repo>/packages/natives/native/
-```
-
-Version-match it. A stale addon fails with `api().vcsDiscover is not a function`.
 
 ---
 
