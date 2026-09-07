@@ -2229,6 +2229,87 @@ describe("InteractiveMode plan review rendering", () => {
 				capturedOverlay?.dispose();
 			}
 		});
+
+		it("executes the external-editor text, not a stale in-overlay snapshot", async () => {
+			// Regression (PR #11166 review): an in-overlay section delete sets
+			// `editedContent`, but `setPlanContent` deliberately does not re-emit
+			// `onPlanEdited`, so a later external-editor save left that pre-editor
+			// snapshot in place. On approval the branch preferred the stale snapshot
+			// and wrote it back over the file, discarding the editor's work.
+			const editorPath = path.join(tempDir.path(), "replacing-editor.sh");
+			await Bun.write(editorPath, "#!/bin/sh\nprintf '# Plan\\n\\nfrom external editor\\n' > \"$1\"\n");
+			await fs.chmod(editorPath, 0o755);
+			const previousEditor = Bun.env.EDITOR;
+			const previousVisual = Bun.env.VISUAL;
+			const keybindings = KeybindingsManager.inMemory({ "app.editor.external": "ctrl+e" });
+			mode.keybindings = keybindings;
+			setKeybindings(keybindings);
+
+			// Short window: the resumed countdown is what approves the plan, so the
+			// assertion covers the unattended path rather than a synthetic keypress.
+			session.settings.set("plan.approvalTimeout", 0.3);
+
+			const planFilePath = "local://PLAN.md";
+			const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			});
+			await Bun.write(resolvedPlanPath, "# Plan\n\nintro\n\n## Doomed\n\ndelete me\n\n## Keep\n\nkeep me\n");
+			mode.planModeEnabled = true;
+			mode.planModePlanFilePath = planFilePath;
+			vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+			vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+			vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+			const { promise: editorReturned, resolve: markEditorReturned } = Promise.withResolvers<void>();
+			const setPlanContent = PlanReviewOverlay.prototype.setPlanContent;
+			vi.spyOn(PlanReviewOverlay.prototype, "setPlanContent").mockImplementation(function (
+				this: PlanReviewOverlay,
+				content: string,
+			) {
+				setPlanContent.call(this, content);
+				markEditorReturned();
+			});
+
+			let capturedOverlay: PlanReviewOverlay | undefined;
+			const { promise: overlayMounted, resolve: markOverlayMounted } = Promise.withResolvers<void>();
+			vi.spyOn(mode.ui, "showOverlay").mockImplementation(component => {
+				capturedOverlay = component as PlanReviewOverlay;
+				markOverlayMounted();
+				return { hide: vi.fn() } as never;
+			});
+
+			try {
+				Bun.env.EDITOR = editorPath;
+				delete Bun.env.VISUAL;
+				const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+				// `handlePlanApproval` awaits file I/O before mounting; wait for the
+				// real mount signal rather than guessing a microtask depth.
+				await overlayMounted;
+
+				const overlay = capturedOverlay!;
+				overlay.render(80);
+				// Delete a section in the overlay -> populates `editedContent`.
+				overlay.handleInput("\t"); // focus the ToC
+				overlay.handleInput("\x1b[B"); // move onto "Doomed"
+				overlay.handleInput("d");
+				// Then round-trip through the external editor, which replaces the file.
+				overlay.handleInput("\x05"); // ctrl+e
+				await editorReturned;
+
+				// The resumed countdown approves it — the unattended path where a
+				// stale snapshot would silently overwrite the operator's editor work.
+				await approval;
+
+				expect(await Bun.file(resolvedPlanPath).text()).toBe("# Plan\n\nfrom external editor\n");
+			} finally {
+				if (previousEditor === undefined) delete Bun.env.EDITOR;
+				else Bun.env.EDITOR = previousEditor;
+				if (previousVisual === undefined) delete Bun.env.VISUAL;
+				else Bun.env.VISUAL = previousVisual;
+				capturedOverlay?.dispose();
+			}
+		});
 	});
 
 	describe("openPlanReview (manual /plan-review)", () => {

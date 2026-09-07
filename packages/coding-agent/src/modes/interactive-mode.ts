@@ -3718,7 +3718,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async #openPlanInExternalEditor(planFilePath: string): Promise<void> {
+	async #openPlanInExternalEditor(planFilePath: string, onEditorResult?: (content: string) => void): Promise<void> {
 		const editorCmd = getEditorCommand();
 		if (!editorCmd) {
 			this.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
@@ -3752,6 +3752,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (result !== null) {
 				await Bun.write(resolvedPath, result);
 				this.#planReviewOverlay?.setPlanContent(result);
+				// The editor is now the newest authority on the plan. Without this the
+				// caller's `editedContent` keeps a pre-editor in-overlay snapshot and
+				// the approval branch would write that stale text back over the file.
+				onEditorResult?.(result);
 				this.showStatus("Plan updated in external editor.");
 			}
 		} catch (error) {
@@ -4624,7 +4628,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			],
 			{
 				helpText,
-				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
+				onExternalEditor: () =>
+					void this.#openPlanInExternalEditor(planFilePath, content => {
+						editedContent = content;
+					}),
 				onPlanEdited: content => {
 					editedContent = content;
 					void Bun.write(this.#resolvePlanFilePath(planFilePath), content);
