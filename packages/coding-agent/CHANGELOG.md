@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Timed auto-accept for plan approval: `plan.approvalTimeout` counts down on the plan-review overlay and auto-selects `plan.approvalDefault` (`execute`/`compact`/`keep-context`) when nobody is at the keyboard, so plan → implement can run unattended. Any keypress restarts the window, a disabled keep-context option falls back to execute, and the transcript records that the approval was automatic. Defaults to off.
+- `ask.timeoutInPlanMode` applies `ask.timeout` during plan mode, which previously always waited indefinitely. Defaults to off.
+
 ## [18.1.14] - 2026-09-07
 
 ### Fixed

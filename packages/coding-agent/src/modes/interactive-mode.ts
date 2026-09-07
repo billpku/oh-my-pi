@@ -3536,6 +3536,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			annotationState?: PlanReviewAnnotationState;
 			onAnnotationStateChange?: (state: PlanReviewAnnotationState) => void;
 			initialIndex?: number;
+			timeoutMs?: number;
+			timeoutIndex?: number;
+			onTimeoutSelect?: (label: string) => void;
 		},
 		extra?: { slider?: HookSelectorSlider },
 	): Promise<string | undefined> {
@@ -3559,9 +3562,13 @@ export class InteractiveMode implements InteractiveModeContext {
 				slider: extra?.slider,
 				externalEditorLabel: this.keybindings.getDisplayString("app.editor.external") || undefined,
 				annotationState: dialogOptions?.annotationState,
+				timeoutMs: dialogOptions?.timeoutMs,
+				timeoutIndex: dialogOptions?.timeoutIndex,
+				tui: this.ui,
 			},
 			{
 				onPick: choice => finish(choice),
+				onTimeoutSelect: dialogOptions?.onTimeoutSelect,
 				onCancel: () => finish(undefined),
 				onCopyPlan: content => void this.#copyPlanToClipboard(content),
 				onExternalEditor: dialogOptions?.onExternalEditor,
@@ -3585,6 +3592,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#hidePlanReview(): void {
+		// Dispose before dropping the handle: Esc, #dismissPlanReview, and the
+		// post-approval closePlanReview() all route through here, and a live
+		// countdown interval would keep ticking against a hidden overlay.
+		this.#planReviewOverlay?.dispose();
 		this.#planReviewCancel = undefined;
 		this.#planReviewOverlayHandle?.hide();
 		this.#planReviewOverlayHandle = undefined;
@@ -4567,6 +4578,23 @@ export class InteractiveMode implements InteractiveModeContext {
 		let feedback = "";
 		const annotationStateKey = this.#resolvePlanFilePath(planFilePath);
 
+		// Timed auto-accept: when `plan.approvalTimeout` is set, an unattended
+		// overlay commits `plan.approvalDefault` instead of blocking forever.
+		// "Refine plan" and "Save and quit" are never auto-select targets —
+		// expiry means no operator is present, so looping the model or quitting
+		// the session would both be wrong. Keep-context falls back to index 0
+		// when the context is too full for that option: a fresh-context execute
+		// is always available, and skipping the auto-select would reintroduce
+		// the indefinite wait the timeout exists to remove.
+		const approvalTimeoutSeconds = this.session.settings.get("plan.approvalTimeout");
+		const approvalDefault = this.session.settings.get("plan.approvalDefault");
+		const preferredIndex =
+			approvalDefault === "compact" ? 1 : approvalDefault === "keep-context" ? PLAN_KEEP_CONTEXT_OPTION_INDEX : 0;
+		const timeoutIndex =
+			keepContextDisabled && preferredIndex === PLAN_KEEP_CONTEXT_OPTION_INDEX ? 0 : preferredIndex;
+		const timeoutMs = approvalTimeoutSeconds > 0 ? approvalTimeoutSeconds * 1000 : undefined;
+		let autoSelected = false;
+
 		const choice = await this.showPlanReview(
 			planContent,
 			"Plan mode - next step",
@@ -4593,6 +4621,11 @@ export class InteractiveMode implements InteractiveModeContext {
 					else this.#planReviewAnnotationState.delete(annotationStateKey);
 				},
 				disabledIndices: keepContextDisabled ? [PLAN_KEEP_CONTEXT_OPTION_INDEX] : undefined,
+				timeoutMs,
+				timeoutIndex,
+				onTimeoutSelect: () => {
+					autoSelected = true;
+				},
 			},
 			{ slider },
 		);
@@ -4617,6 +4650,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		if (choice === "Approve and execute" || choice === "Approve and compact context" || choice === keepContextLabel) {
+			// Disclose that nobody picked this — the transcript must not read as a
+			// deliberate operator choice. Mirrors ask's "auto-selected after timeout".
+			if (autoSelected) {
+				this.showWarning(`Plan auto-approved after ${approvalTimeoutSeconds}s with "${choice}".`);
+			}
 			try {
 				// Prefer in-overlay edits (already in memory) over a disk re-read. The
 				// overlay mirrors edits as they happen, and approval awaits one final

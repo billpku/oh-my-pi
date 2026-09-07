@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { Agent, AgentBusyError, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
@@ -1970,6 +1971,158 @@ describe("InteractiveMode plan review rendering", () => {
 
 		expect(selector).toHaveBeenCalledTimes(2);
 		expect(showError).not.toHaveBeenCalled();
+	});
+
+	describe("timed auto-accept (plan.approvalTimeout / plan.approvalDefault)", () => {
+		/** Runs one approval, resolving the overlay through the auto-select target
+		 *  the caller plumbed rather than a keypress, and reports what was passed. */
+		const driveTimedApproval = async (): Promise<{
+			timeoutMs: number | undefined;
+			timeoutIndex: number | undefined;
+			disabledIndices: number[] | undefined;
+			choice: string | undefined;
+		}> => {
+			const planFilePath = "local://PLAN.md";
+			const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			});
+			await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+			mode.planModeEnabled = true;
+			mode.planModePlanFilePath = planFilePath;
+			vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+			vi.spyOn(mode, "handleCompactCommand").mockResolvedValue("ok");
+			vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+			let timeoutMs: number | undefined;
+			let timeoutIndex: number | undefined;
+			let disabledIndices: number[] | undefined;
+			let choice: string | undefined;
+			vi.spyOn(mode, "showPlanReview").mockImplementation(async (_plan, _title, options, dialogOptions) => {
+				timeoutMs = dialogOptions?.timeoutMs;
+				timeoutIndex = dialogOptions?.timeoutIndex;
+				disabledIndices = dialogOptions?.disabledIndices;
+				if (dialogOptions?.timeoutMs === undefined) return undefined;
+				choice = options[dialogOptions.timeoutIndex ?? 0]!;
+				dialogOptions.onTimeoutSelect?.(choice);
+				return choice;
+			});
+
+			await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+			return { timeoutMs, timeoutIndex, disabledIndices, choice };
+		};
+
+		it("plumbs no timeout by default so the overlay keeps blocking", async () => {
+			const result = await driveTimedApproval();
+			expect(result.timeoutMs).toBeUndefined();
+			expect(result.choice).toBeUndefined();
+		});
+
+		it("converts plan.approvalTimeout to ms and auto-approves on the execute option", async () => {
+			session.settings.set("plan.approvalTimeout", 600);
+			const warn = vi.spyOn(mode, "showWarning");
+
+			const result = await driveTimedApproval();
+
+			expect(result.timeoutMs).toBe(600_000);
+			expect(result.timeoutIndex).toBe(0);
+			expect(result.choice).toBe("Approve and execute");
+			expect(mode.planModeEnabled).toBe(false);
+			// The transcript must not read as a deliberate operator choice.
+			expect(warn).toHaveBeenCalledWith(expect.stringContaining("Plan auto-approved after 600s"));
+		});
+
+		it("targets the compact option when plan.approvalDefault is compact", async () => {
+			session.settings.set("plan.approvalTimeout", 30);
+			session.settings.set("plan.approvalDefault", "compact");
+
+			const result = await driveTimedApproval();
+
+			expect(result.timeoutIndex).toBe(1);
+			expect(result.choice).toBe("Approve and compact context");
+		});
+
+		it("targets the keep-context option when it is selectable", async () => {
+			session.settings.set("plan.approvalTimeout", 45);
+			session.settings.set("plan.approvalDefault", "keep-context");
+			vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 4000, contextWindow: 10000, percent: 40 });
+
+			const result = await driveTimedApproval();
+
+			expect(result.disabledIndices).toBeUndefined();
+			expect(result.timeoutIndex).toBe(2);
+			expect(result.choice).toMatch(/^Approve and keep context/);
+		});
+
+		it("falls back to execute rather than auto-selecting a disabled keep-context option", async () => {
+			session.settings.set("plan.approvalTimeout", 45);
+			session.settings.set("plan.approvalDefault", "keep-context");
+			vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 9700, contextWindow: 10000, percent: 97 });
+
+			const result = await driveTimedApproval();
+
+			expect(result.disabledIndices).toEqual([2]);
+			expect(result.timeoutIndex).toBe(0);
+			expect(result.choice).toBe("Approve and execute");
+		});
+
+		it("stays silent about auto-approval when the operator picks manually", async () => {
+			session.settings.set("plan.approvalTimeout", 600);
+			const warn = vi.spyOn(mode, "showWarning");
+			const planFilePath = "local://PLAN.md";
+			const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			});
+			await Bun.write(resolvedPlanPath, "# Plan\n\nbody");
+			mode.planModeEnabled = true;
+			mode.planModePlanFilePath = planFilePath;
+			vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+			vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+			// No onTimeoutSelect call: a real keypress resolved the overlay.
+			vi.spyOn(mode, "showPlanReview").mockResolvedValue("Approve and execute");
+
+			await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+			expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("auto-approved"));
+		});
+
+		it("drives the real overlay from countdown expiry through execution dispatch", async () => {
+			// End-to-end: no showPlanReview mock. The real PlanReviewOverlay mounts,
+			// its countdown expires, and the approval resolves into the execution
+			// turn — the unattended plan → implement path this setting exists for.
+			session.settings.set("plan.approvalTimeout", 0.15);
+			const planFilePath = "local://PLAN.md";
+			const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			});
+			await Bun.write(resolvedPlanPath, "# Plan\n\nAdd hello() to notes.ts.");
+			mode.planModeEnabled = true;
+			mode.planModePlanFilePath = planFilePath;
+			vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+			vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+			const warn = vi.spyOn(mode, "showWarning");
+			const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+			let renderedPrompt = "";
+			const overlayHandle = { hide: vi.fn() };
+			vi.spyOn(mode.ui, "showOverlay").mockImplementation(component => {
+				const overlay = component as PlanReviewOverlay;
+				renderedPrompt = stripVTControlCharacters(overlay.render(80).join("\n"));
+				return overlayHandle as never;
+			});
+
+			await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+
+			// The operator saw a live countdown, nobody pressed a key, and the
+			// session left plan mode and dispatched the execution turn.
+			expect(renderedPrompt).toContain("Plan mode - next step (1s)");
+			expect(warn).toHaveBeenCalledWith(expect.stringContaining("Plan auto-approved"));
+			expect(mode.planModeEnabled).toBe(false);
+			expect(prompt.mock.calls.some(isPlanApprovedCall)).toBe(true);
+			expect(overlayHandle.hide).toHaveBeenCalled();
+		});
 	});
 
 	describe("openPlanReview (manual /plan-review)", () => {
